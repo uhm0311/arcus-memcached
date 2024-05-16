@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+      branches: [ "master" ]
+  pull_request:
+      branches: [ "develop" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    - name: Setup
+      uses: ./.github/actions/setup
+    - name: Build ARCUS Cache Server
+      run: make
+    - name: Test ARCUS Server
+      run: make test
