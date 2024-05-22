@@ -728,6 +728,7 @@ conn *conn_new(const int sfd, STATE_FUNC init_state,
                            "getpeername(fd=%d) has failed: %s\n",
                            c->sfd, strerror(errno));
         }
+        memset(&addr, 0, sizeof(addr));
     }
     snprintf(c->client_ip, 16, "%s", inet_ntoa(addr.sin_addr));
 
@@ -13619,7 +13620,6 @@ bool conn_listening(conn *c)
 
     if (curr_conns >= settings.maxconns) {
         /* Allow admin connection even if # of connections is over maxconns */
-        getpeername(sfd, (struct sockaddr*)&addr, &addrlen);
         struct sockaddr_in *sin = (struct sockaddr_in *)&addr;
         if (strcmp(inet_ntoa(sin->sin_addr), ADMIN_CLIENT_IP) != 0 ||
             curr_conns >= settings.maxconns + ADMIN_MAX_CONNECTIONS)
