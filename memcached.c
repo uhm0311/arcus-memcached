@@ -63,6 +63,7 @@
 
 #include "cmdlog.h"
 #include "lqdetect.h"
+#include "tls.h"
 
 /* Lock for global stats */
 static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -167,6 +168,34 @@ enum transmit_result {
 
 static enum transmit_result transmit(conn *c);
 
+#define MIN(x, y) (((x) < (y)) ? (x) : (y))
+
+/* Default methods to read from/ write to a socket */
+static ssize_t tcp_read(conn *c, void *buf, size_t count) {
+    assert (c != NULL);
+    if (c->bevent != NULL) {
+        return bufferevent_read(c->bevent, buf, count);
+    }
+    return read(c->sfd, buf, count);
+}
+
+static ssize_t tcp_write(conn *c, void *buf, size_t count) {
+    assert (c != NULL);
+    return write(c->sfd, buf, count);
+}
+
+static ssize_t tcp_sendmsg(conn *c, struct msghdr *msg, int flags) {
+    assert (c != NULL);
+    return sendmsg(c->sfd, msg, flags);
+}
+
+static size_t tcp_bev_rbuf_size(conn *c) {
+    assert (c != NULL);
+    if (c->bevent != NULL) {
+        return evbuffer_get_length(bufferevent_get_input(c->bevent));
+    }
+    return -1;
+}
 
 /* time-sensitive callers can call it by hand with this,
  * outside the normal ever-1-second timer
@@ -333,6 +362,7 @@ static void settings_init(void)
     settings.access = 0700;
     settings.port = 11211;
     settings.udpport = 0;
+    ssl_init_settings();
     /* By default this string should be NULL for getaddrinfo() */
     settings.inter = NULL;
     settings.maxbytes = 64 * 1024 * 1024; /* default is 64MB */
@@ -576,16 +606,138 @@ static void conn_destructor(void *buffer, void *unused)
     free(c->suffixlist);
     free(c->iov);
     free(c->msglist);
+    if (c->ssl_wbuf) {
+        c->ssl_wbuf = NULL;
+    }
 
     LOCK_STATS();
     mc_stats.conn_structs--;
     UNLOCK_STATS();
 }
 
+static void conn_init_network_functions(conn *c, void *ssl)
+{
+    if (c == NULL) {
+        return;
+    }
+
+    c->bev_rbuf_size = tcp_bev_rbuf_size;
+    if (ssl == NULL) {
+        c->read = tcp_read;
+        c->write = tcp_write;
+        c->sendmsg = tcp_sendmsg;
+        c->ssl_enabled = false;
+        return;
+    }
+
+    // must not get here without ssl enabled.
+    assert(settings.ssl_enabled);
+    ssl_init_conn(c, ssl);
+    c->ssl_enabled = true;
+}
+
+bool conn_init_for_hb(conn *c, int sfd, void *ssl)
+{
+    if (c == NULL) {
+        return false;
+    }
+    c->sfd = sfd;
+
+    c->ssl_wbuf = (char *) malloc((size_t) settings.ssl_wbuf_size);
+    if (c->ssl_wbuf == NULL) {
+        fprintf(stderr, "Failed to allocate the SSL write buffer\n");
+        conn_close_for_hb(c);
+        return false;
+    }
+
+    conn_init_network_functions(c, ssl);
+    return true;
+}
+
+void conn_close_for_hb(conn *c)
+{
+    if (c == NULL) {
+        return;
+    }
+#ifdef TLS
+    if (settings.ssl_enabled) {
+        if (c->ssl) {
+            ssl_conn_close(c->ssl);
+            c->ssl = NULL;
+        }
+        if (c->ssl_wbuf) {
+            free(c->ssl_wbuf);
+            c->ssl_wbuf = NULL;
+        }
+    }
+#endif
+
+    safe_close(c->sfd);
+}
+
+static void read_cb(struct bufferevent *bev, void *arg) {
+    conn *c = (conn *) arg;
+    assert(c != NULL && c->bevent == bev);
+
+    printf("%d: read_cb: %zu\n", c->sfd, c->bev_rbuf_size(c));
+    if (c->state != conn_nread) {
+        conn_set_state(c, conn_read);
+    }
+    event_handler(c->sfd, EV_READ, arg);
+}
+
+static void write_cb(struct bufferevent *bev, void *arg) {
+    conn *c = (conn *) arg;
+    assert(c != NULL && c->bevent == bev);
+
+    event_handler(c->sfd, EV_WRITE, arg);
+}
+
+static void event_cb(struct bufferevent *bev, short events, void *arg) {
+    conn *c = (conn *) arg;
+    assert(c != NULL && c->bevent == bev);
+
+    if (events & BEV_EVENT_EOF) {
+        conn_set_state(c, conn_closing);
+        event_handler(c->sfd, EV_CLOSED, arg);
+        return;
+    }
+    if ((events & BEV_EVENT_ERROR) == 0) {
+        return;
+    }
+
+    int err = EVUTIL_SOCKET_ERROR();
+    if (err == EAGAIN || err == EWOULDBLOCK) {
+        return;
+    }
+
+    EXTENSION_LOG_LEVEL level;
+    if (err != ENOTCONN && err != ECONNRESET) {
+        level = EXTENSION_LOG_WARNING;
+    } else {
+        level = EXTENSION_LOG_DEBUG;
+    }
+
+    mc_logger->log(level, c,
+            "%d: BEV_EVENT_ERROR, and not due to blocking: err=(%d:%s), client_ip: %s\n",
+            c->sfd, err, evutil_socket_error_to_string(err), c->client_ip);
+
+    if (settings.ssl_enabled) {
+        unsigned long ssl_err;
+        while ((ssl_err = bufferevent_get_openssl_error(bev))) {
+            mc_logger->log(level, c, "%d: SSL error=(%lu:%s)\n",
+                           c->sfd, ssl_err, ERR_reason_error_string(ssl_err));
+        }
+    }
+
+    conn_set_state(c, conn_closing);
+    event_handler(c->sfd, EV_CLOSED, arg);
+}
+
 conn *conn_new(const int sfd, STATE_FUNC init_state,
                 const int event_flags,
                 const int read_buffer_size, enum network_transport transport,
-                struct event_base *base, struct timeval *timeout)
+                struct event_base *base, struct timeval *timeout, void *ssl)
 {
     conn *c = cache_alloc(conn_cache);
     if (c == NULL) {
@@ -643,6 +795,7 @@ conn *conn_new(const int sfd, STATE_FUNC init_state,
 
     c->sfd = sfd;
     c->state = init_state;
+    c->bevent = NULL;
     c->cmd = -1;
     c->ascii_cmd = NULL;
     c->rbytes = c->wbytes = 0;
@@ -685,16 +838,49 @@ conn *conn_new(const int sfd, STATE_FUNC init_state,
     c->pipe_count = 0;
     c->noreply = false;
 
-    event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
-    event_base_set(base, &c->event);
-    c->ev_flags = event_flags;
+    c->ssl = NULL;
+    c->read = NULL;
+    c->write = NULL;
+    c->sendmsg = NULL;
+    c->bev_rbuf_size = NULL;
+    c->ssl_wbuf = NULL;
+    conn_init_network_functions(c, ssl);
 
-    if (event_add(&c->event, timeout) == -1) {
-        mc_logger->log(EXTENSION_LOG_WARNING, NULL,
-                       "Failed to add connection to libevent: %s", strerror(errno));
-        assert(c->thread == NULL);
-        cache_free(conn_cache, c);
-        return NULL;
+    if (init_state == conn_listening) {
+        event_set(&c->event, sfd, event_flags, event_handler, (void *) c);
+        event_base_set(base, &c->event);
+        c->ev_flags = event_flags;
+
+        if (event_add(&c->event, timeout) == -1) {
+            mc_logger->log(EXTENSION_LOG_WARNING, NULL,
+                           "Failed to add connection to libevent: %s", strerror(errno));
+            assert(c->thread == NULL);
+            cache_free(conn_cache, c);
+            return NULL;
+        }
+    } else {
+        if (settings.ssl_enabled && ssl != NULL) {
+            c->bevent = bufferevent_openssl_socket_new(base, c->sfd, c->ssl, BUFFEREVENT_SSL_ACCEPTING, 0);
+        } else {
+            c->bevent = bufferevent_socket_new(base, c->sfd, 0);
+        }
+
+        if (c->bevent == NULL) {
+            mc_logger->log(EXTENSION_LOG_WARNING, NULL,
+                           "Failed to add connection to libevent: %s", strerror(errno));
+            assert(c->thread == NULL);
+            cache_free(conn_cache, c);
+            return NULL;
+        }
+
+        bufferevent_setcb(c->bevent, read_cb, write_cb, event_cb, (void *) c);
+        if (bufferevent_enable(c->bevent, EV_READ | EV_WRITE) == -1) {
+            mc_logger->log(EXTENSION_LOG_WARNING, NULL,
+                           "Failed to add connection to libevent: %s", strerror(errno));
+            assert(c->thread == NULL);
+            cache_free(conn_cache, c);
+            return NULL;
+        }
     }
 
     LOCK_STATS();
@@ -891,7 +1077,11 @@ void conn_close(conn *c)
     /* delete the event, the socket and the conn */
     if (c->sfd != -1) {
         MEMCACHED_CONN_RELEASE(c->sfd);
-        event_del(&c->event);
+        if (c->bevent != NULL) {
+            bufferevent_disable(c->bevent, EV_READ | EV_WRITE);
+        } else {
+            event_del(&c->event);
+        }
 
         if (settings.verbose > 1) {
             mc_logger->log(EXTENSION_LOG_DEBUG, c,
@@ -924,6 +1114,11 @@ void conn_close(conn *c)
     }
     c->thread = NULL;
     assert(c->next == NULL);
+
+    if (c->ssl_enabled && c->ssl) {
+        ssl_conn_close(c);
+        c->ssl = NULL;
+    }
 
     /*
      * The contract with the object cache is that we should return the
@@ -7590,7 +7785,9 @@ static void reset_cmd_handler(conn *c)
         mblck_list_free(&c->thread->mblck_pool, &c->memblist);
         c->coll_strkeys = NULL;
     }
-    conn_shrink(c);
+    if (!(rand() >= -1)) {
+        conn_shrink(c);
+    }
     if (c->rbytes > 0) {
         conn_set_state(c, conn_parse_cmd);
     } else {
@@ -7628,6 +7825,7 @@ static void complete_nread_ascii(conn *c)
                                c->dynamic_buffer.offset);
                 c->dynamic_buffer.buffer = NULL;
             } else {
+                printf("complete_nread_ascii: conn_set_state(c, conn_new_cmd)\n");
                 conn_set_state(c, conn_new_cmd);
             }
         }
@@ -8091,6 +8289,16 @@ static void server_stats(ADD_STAT add_stats, conn *c, bool aggregate)
     APPEND_STAT("limit_maxconns", "%d", settings.maxconns);
     APPEND_STAT("threads", "%d", settings.num_threads);
     APPEND_STAT("conn_yields", "%"PRIu64, thread_stats.conn_yields);
+#ifdef TLS
+    if (settings.ssl_enabled) {
+        if (settings.ssl_session_cache) {
+            APPEND_STAT("ssl_new_sessions", "%llu", (unsigned long long) mc_stats.ssl_new_sessions);
+        }
+        APPEND_STAT("ssl_handshake_errors", "%llu", (unsigned long long) mc_stats.ssl_handshake_errors);
+        APPEND_STAT("ssl_proto_errors", "%llu", (unsigned long long) mc_stats.ssl_proto_errors);
+        APPEND_STAT("time_since_server_cert_refresh", "%u", now - settings.ssl_last_cert_refresh_time);
+    }
+#endif
     UNLOCK_STATS();
 }
 
@@ -8151,6 +8359,19 @@ static void process_stats_settings(ADD_STAT add_stats, void *c)
 #ifdef ENABLE_ZK_INTEGRATION
     APPEND_STAT("hb_timeout", "%u", hb_confs.timeout);
     APPEND_STAT("hb_failstop", "%u", hb_confs.failstop);
+#endif
+#ifdef TLS
+    APPEND_STAT("ssl_enabled", "%s", settings.ssl_enabled ? "yes" : "no");
+    APPEND_STAT("ssl_chain_cert", "%s", settings.ssl_chain_cert);
+    APPEND_STAT("ssl_key", "%s", settings.ssl_key);
+    APPEND_STAT("ssl_verify_mode", "%d", settings.ssl_verify_mode);
+    APPEND_STAT("ssl_keyformat", "%d", settings.ssl_keyformat);
+    APPEND_STAT("ssl_ciphers", "%s", settings.ssl_ciphers ? settings.ssl_ciphers : "NULL");
+    APPEND_STAT("ssl_ca_cert", "%s", settings.ssl_ca_cert ? settings.ssl_ca_cert : "NULL");
+    APPEND_STAT("ssl_wbuf_size", "%u", settings.ssl_wbuf_size);
+    APPEND_STAT("ssl_session_cache", "%s", settings.ssl_session_cache ? "yes" : "no");
+    APPEND_STAT("ssl_kernel_tls", "%s", settings.ssl_kernel_tls ? "yes" : "no");
+    APPEND_STAT("ssl_min_version", "%s", ssl_proto_text(settings.ssl_min_version));
 #endif
 
     for (EXTENSION_DAEMON_DESCRIPTOR *ptr = settings.extensions.daemons;
@@ -13441,7 +13662,9 @@ static enum try_read_result try_read_network(conn *c)
         }
 
         int avail = c->rsize - c->rbytes;
-        int res = read(c->sfd, c->rbuf + c->rbytes, avail);
+        // int res = read(c->sfd, c->rbuf + c->rbytes, avail);
+        int res = c->read(c, c->rbuf + c->rbytes, avail);
+
         if (res > 0) {
             STATS_ADD(c, bytes_read, res);
             gotdata = READ_DATA_RECEIVED;
@@ -13453,6 +13676,10 @@ static enum try_read_result try_read_network(conn *c)
             }
         }
         if (res == 0) {
+            if (c->bev_rbuf_size(c) == 0) {
+                printf("%d: returning 0 in try_read_network...\n", c->sfd);
+                return READ_NO_DATA_RECEIVED;
+            }
             /* The client called shutdown() to close the socket. */
             if (settings.verbose > 1) {
                 mc_logger->log(EXTENSION_LOG_DEBUG, c,
@@ -13479,16 +13706,22 @@ static enum try_read_result try_read_network(conn *c)
 static bool update_event(conn *c, const int new_flags)
 {
     assert(c != NULL);
-    struct event_base *base = c->event.ev_base;
-
-    if (c->ev_flags == new_flags)
+    if (c->ev_flags == new_flags) {
         return true;
+    }
 
     mc_logger->log(EXTENSION_LOG_DEBUG, NULL,
-                   "Updated event for %d to read=%s, write=%s\n",
+                   "Updated event for %d to read=%s, write=%s, bevent=%s\n",
                    c->sfd, (new_flags & EV_READ ? "yes" : "no"),
-                   (new_flags & EV_WRITE ? "yes" : "no"));
+                   (new_flags & EV_WRITE ? "yes" : "no"),
+                   (c->bevent != NULL ? "yes" : "no"));
 
+    if (c->bevent != NULL) {
+        c->ev_flags = new_flags;
+        return true;
+    }
+
+    struct event_base *base = c->event.ev_base;
     if (event_del(&c->event) == -1) return false;
     event_set(&c->event, c->sfd, new_flags, event_handler, (void *)c);
     event_base_set(base, &c->event);
@@ -13522,7 +13755,9 @@ static enum transmit_result transmit(conn *c)
             build_udp_header(c);
         }
 
-        res = sendmsg(c->sfd, m, 0);
+        // res = sendmsg(c->sfd, m, 0);
+        res = c->sendmsg(c, m, 0);
+
         if (res > 0) {
             STATS_ADD(c, bytes_written, res);
 
@@ -13554,6 +13789,7 @@ static enum transmit_result transmit(conn *c)
         /* if res == 0 or res == -1 and error is not EAGAIN or EWOULDBLOCK,
            we have a real error, on which we close the connection */
         if (settings.verbose > 0) {
+            printf("res: %d, errno: %d\n", (int) res, errno);
             mc_logger->log(EXTENSION_LOG_INFO, c,
                            "Failed to write, and not due to blocking: %s, client_ip: %s\n",
                            strerror(errno), c->client_ip);
@@ -13629,8 +13865,17 @@ bool conn_listening(conn *c)
         return false;
     }
 
+    // run accept routine if ssl is compiled + enabled
+    bool fail = false;
+    void *ssl_v = ssl_accept(c, sfd, &fail);
+
+    if (fail) {
+        close(sfd);
+        return false;
+    }
+
     dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
-                      DATA_BUFFER_SIZE, tcp_transport);
+                      DATA_BUFFER_SIZE, tcp_transport, ssl_v);
     return false;
 }
 
@@ -13648,7 +13893,10 @@ bool conn_waiting(conn *c)
 
 bool conn_read(conn *c)
 {
+    fflush(stdout);
     int res = IS_UDP(c->transport) ? try_read_udp(c) : try_read_network(c);
+    fflush(stdout);
+
     switch (res) {
     case READ_NO_DATA_RECEIVED:
         conn_set_state(c, conn_waiting);
@@ -13693,6 +13941,7 @@ bool conn_new_cmd(conn *c)
 {
     /* Only process nreqs at a time to avoid starving other connections */
     --c->nevents;
+    printf("c->nevents: %d\n", c->nevents);
     if (c->nevents >= 0) {
         reset_cmd_handler(c);
     } else {
@@ -13711,9 +13960,10 @@ bool conn_new_cmd(conn *c)
                 return true;
             }
         }
+
+        printf("%d: buf_size: %zu\n", c->sfd, c->bev_rbuf_size(c));
         return false;
     }
-
     return true;
 }
 
@@ -13737,13 +13987,19 @@ bool conn_swallow(conn *c)
     }
 
     /*  now try reading from the socket */
-    res = read(c->sfd, c->rbuf, c->rsize > c->sbytes ? c->sbytes : c->rsize);
+    // res = read(c->sfd, c->rbuf, c->rsize > c->sbytes ? c->sbytes : c->rsize);
+    res = c->read(c, c->rbuf, c->rsize > c->sbytes ? c->sbytes : c->rsize);
+
     if (res > 0) {
         STATS_ADD(c, bytes_read, res);
         c->sbytes -= res;
         return true;
     }
     if (res == 0) { /* end of stream */
+        if (c->bev_rbuf_size(c) == 0) {
+            printf("%d: returning 0 in conn_swallow...\n", c->sfd);
+            return false;
+        }
         if (settings.verbose > 0) {
             mc_logger->log(EXTENSION_LOG_INFO, c,
                            "Couldn't read in conn_swallow: end of stream.\n");
@@ -13792,6 +14048,7 @@ bool conn_nread(conn *c)
         if (c->ewouldblock) {
             c->ewouldblock = false;
             if (should_io_blocked(c)) {
+                printf("%d: should_io_blocked!!!\n", c->sfd);
                 return false; /* blocked */
             }
         }
@@ -13821,7 +14078,9 @@ bool conn_nread(conn *c)
     }
 
     /*  now try reading from the socket */
-    res = read(c->sfd, c->ritem, c->rlbytes);
+    // res = read(c->sfd, c->ritem, c->rlbytes);
+    res = c->read(c, c->ritem, c->rlbytes);
+
     if (res > 0) {
         STATS_ADD(c, bytes_read, res);
         if (c->rcurr == c->ritem) {
@@ -13838,6 +14097,10 @@ bool conn_nread(conn *c)
         return true;
     }
     if (res == 0) { /* end of stream */
+        if (c->bev_rbuf_size(c) == 0) {
+            printf("%d: returning 0 in conn_nread...\n", c->sfd);
+            return false;
+        }
         if (settings.verbose > 0) {
             mc_logger->log(EXTENSION_LOG_INFO, c,
                            "Couldn't read in conn_nread: end of stream.\n");
@@ -13852,6 +14115,7 @@ bool conn_nread(conn *c)
             conn_set_state(c, conn_closing);
             return true;
         }
+        printf("%d: res == -1!!!\n", c->sfd);
         return false;
     }
 
@@ -14002,7 +14266,11 @@ void event_handler(const int fd, const short which, void *arg)
                 mc_logger->log(EXTENSION_LOG_INFO, c,
                         "Main thread is now terminating from event handler.\n");
             }
-            event_base_loopbreak(c->event.ev_base);
+            if (c->bevent != NULL) {
+                event_base_loopbreak(c->bevent->ev_base);
+            } else {
+                event_base_loopbreak(c->event.ev_base);
+            }
             return;
         }
         if (memcached_shutdown > 1) {
@@ -14011,7 +14279,11 @@ void event_handler(const int fd, const short which, void *arg)
                         "Worker thread[%d] is now terminating from event handler.\n",
                         c->thread->index);
             }
-            event_base_loopbreak(c->event.ev_base);
+            if (c->bevent != NULL) {
+                event_base_loopbreak(c->bevent->ev_base);
+            } else {
+                event_base_loopbreak(c->event.ev_base);
+            }
             return;
         }
     }
@@ -14031,6 +14303,9 @@ void event_handler(const int fd, const short which, void *arg)
     perform_callbacks(ON_SWITCH_CONN, c, c);
 
     c->nevents = settings.reqs_per_event;
+    if (c->bevent != NULL) {
+        c->nevents *= 10;
+    }
 
     while (c->state(c)) {
         /* do task */
@@ -14103,7 +14378,7 @@ static void maximize_sndbuf(const int sfd)
  *        listen on.
  */
 static int server_socket(int port, enum network_transport transport,
-                         FILE *portnumber_file)
+                         FILE *portnumber_file, bool ssl_enabled)
 {
     int sfd;
     struct linger ling = {0, 0};
@@ -14219,7 +14494,7 @@ static int server_socket(int port, enum network_transport transport,
             for (int c = 0; c < settings.num_threads; c++) {
                 /* this is guaranteed to hit all threads because we round-robin */
                 dispatch_conn_new(sfd, conn_read, EV_READ | EV_PERSIST,
-                                  UDP_READ_BUFFER_SIZE, transport);
+                                  UDP_READ_BUFFER_SIZE, transport, NULL);
                 LOCK_STATS();
                 ++mc_stats.daemon_conns;
                 UNLOCK_STATS();
@@ -14227,11 +14502,16 @@ static int server_socket(int port, enum network_transport transport,
         } else {
             if (!(listen_conn_add = conn_new(sfd, conn_listening,
                                              EV_READ | EV_PERSIST, 1,
-                                             transport, main_base, NULL))) {
+                                             transport, main_base, NULL, NULL))) {
                 mc_logger->log(EXTENSION_LOG_WARNING, NULL,
                         "failed to create listening connection\n");
                 exit(EXIT_FAILURE);
             }
+#ifdef TLS
+            listen_conn_add->ssl_enabled = ssl_enabled;
+#else
+            assert(ssl_enabled == false);
+#endif
             listen_conn_add->next = listen_conn;
             listen_conn = listen_conn_add;
             LOCK_STATS();
@@ -14266,7 +14546,7 @@ static int new_socket_unix(void)
 }
 
 /* this will probably not work on windows */
-static int server_socket_unix(const char *path, int access_mask)
+static int server_socket_unix(const char *path, int access_mask, bool ssl_enabled)
 {
     int sfd;
     struct linger ling = {0, 0};
@@ -14319,11 +14599,16 @@ static int server_socket_unix(const char *path, int access_mask)
     }
     if (!(listen_conn = conn_new(sfd, conn_listening,
                                  EV_READ | EV_PERSIST, 1,
-                                 local_transport, main_base, NULL))) {
+                                 local_transport, main_base, NULL, NULL))) {
         mc_logger->log(EXTENSION_LOG_WARNING, NULL,
                 "failed to create listening connection\n");
         exit(EXIT_FAILURE);
     }
+#ifdef TLS
+    listen_conn->ssl_enabled = ssl_enabled;
+#else
+    assert(ssl_enabled == false);
+#endif
 
     LOCK_STATS();
     ++mc_stats.daemon_conns;
@@ -15111,6 +15396,7 @@ int main (int argc, char **argv)
     /* process arguments */
     while (-1 != (c = getopt(argc, argv,
           "a:"  /* access mask for unix socket */
+          "Z"   /* enable SSL */
           "p:"  /* TCP port number to listen on */
           "s:"  /* unix socket path to listen on */
           "U:"  /* UDP port number to listen on */
@@ -15155,6 +15441,15 @@ int main (int argc, char **argv)
         case 'a':
             /* access for unix domain socket, as octal mask (like chmod)*/
             settings.access= strtol(optarg,NULL,8);
+            break;
+        case 'Z':
+            /* enable secure communication*/
+#ifdef TLS
+            settings.ssl_enabled = true;
+#else
+            fprintf(stderr, "This server is not built with TLS support.\n");
+            exit(EX_USAGE);
+#endif
             break;
         case 'U':
             settings.udpport = atoi(optarg);
@@ -15434,6 +15729,22 @@ int main (int argc, char **argv)
 
     if (udp_specified && settings.udpport != 0 && !tcp_specified) {
         settings.port = settings.udpport;
+    }
+
+    /*
+     * Setup SSL if enabled
+     */
+    if (settings.ssl_enabled) {
+        if (!settings.port) {
+            fprintf(stderr, "ERROR: You cannot enable SSL without a TCP port.\n");
+            exit(EX_USAGE);
+        }
+        // for PoC
+        settings.ssl_chain_cert = SSL_HOME_PATH"/server.crt";
+        settings.ssl_key = SSL_HOME_PATH"/server.key";
+
+        // Initiate the SSL context.
+        ssl_init();
     }
 
     /* Following code of setting max collection size will be deprecated. */
@@ -15720,7 +16031,7 @@ int main (int argc, char **argv)
 
     /* create unix mode sockets after dropping privileges */
     if (settings.socketpath != NULL) {
-        if (server_socket_unix(settings.socketpath,settings.access)) {
+        if (server_socket_unix(settings.socketpath,settings.access,settings.ssl_enabled)) {
             vperror("failed to listen on UNIX socket: %s", settings.socketpath);
             exit(EX_OSERR);
         }
@@ -15747,7 +16058,7 @@ int main (int argc, char **argv)
         }
 
         if (settings.port && server_socket(settings.port, tcp_transport,
-                                           portnumber_file)) {
+                                           portnumber_file, settings.ssl_enabled)) {
             vperror("failed to listen on TCP port %d", settings.port);
             exit(EX_OSERR);
         }
@@ -15762,7 +16073,7 @@ int main (int argc, char **argv)
 
         /* create the UDP listening socket and bind it */
         if (settings.udpport && server_socket(settings.udpport, udp_transport,
-                                              portnumber_file)) {
+                                              portnumber_file, settings.ssl_enabled)) {
             vperror("failed to listen on UDP port %d", settings.udpport);
             exit(EX_OSERR);
         }

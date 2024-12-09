@@ -78,6 +78,8 @@ memcached_SOURCES = \
                     hash.h \
                     memcached.c\
                     memcached.h \
+                    tls.h \
+                    tls.c \
                     sasl_defs.h \
                     stats_prefix.c \
                     stats_prefix.h \
@@ -95,7 +97,7 @@ memcached_SOURCES = \
 memcached_LDFLAGS =-R '$(libdir)'
 memcached_CFLAGS = @PROFILER_FLAGS@ ${AM_CFLAGS}
 memcached_DEPENDENCIES = libmcd_util.la
-memcached_LDADD = @PROFILER_LDFLAGS@ libmcd_util.la -levent $(APPLICATION_LIBS)
+memcached_LDADD = @PROFILER_LDFLAGS@ libmcd_util.la -levent -levent_openssl -lssl -lcrypto $(APPLICATION_LIBS)
 
 if BUILD_CACHE
 memcached_SOURCES += cache.c

@@ -20,6 +20,8 @@
 #define _ARCUS_HB_
 
 #include "memcached/extension_loggers.h"
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #ifdef ENABLE_ZK_INTEGRATION
 typedef struct {

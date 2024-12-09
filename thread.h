@@ -205,6 +205,9 @@ typedef struct {
     enum thread_type type;      /* Type of IO this thread processes */
     token_buff_t token_buff;    /* token buffer */
     mblck_pool_t mblck_pool;    /* memory block pool */
+#ifdef TLS
+    char   *ssl_wbuf;
+#endif
 } LIBEVENT_THREAD;
 
 bool   has_cycle(struct conn *c);
@@ -217,7 +220,7 @@ void waitfor_io_complete(const void *cookie);
 void notify_io_complete(const void *cookie, ENGINE_ERROR_CODE status);
 void remove_io_pending(const void *cookie);
 void dispatch_conn_new(int sfd, STATE_FUNC init_state, int event_flags,
-                       int read_buffer_size, enum network_transport transport);
+                       int read_buffer_size, enum network_transport transport, void *ssl);
 int  is_listen_thread(void);
 
 void *threadlocal_stats_create(int num_threads);

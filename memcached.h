@@ -24,10 +24,15 @@
  * structures and function prototypes.
  */
 #include <event.h>
+#include <event2/util.h>
+#include <event2/event.h>
+#include <event2/bufferevent.h>
+#include <event2/bufferevent_ssl.h>
 #include <pthread.h>
 #include <memcached/protocol_binary.h>
 #include <memcached/engine.h>
 #include <memcached/extension.h>
+#include "config.h"
 #include "cache.h"
 #include "topkeys.h"
 #include "mc_util.h"
@@ -201,6 +206,11 @@ struct mc_stats {
     unsigned int  rejected_conns; /* number of times I reject a client */
     unsigned int  total_conns;
     unsigned int  conn_structs;
+#ifdef TLS
+    uint64_t      ssl_proto_errors; /* TLS failures during SSL_read() and SSL_write() calls */
+    uint64_t      ssl_handshake_errors; /* TLS failures at accept/handshake time */
+    uint64_t      ssl_new_sessions; /* successfully negotiated new (non-reused) TLS sessions */
+#endif
 };
 
 union mc_engine {
@@ -251,9 +261,26 @@ struct settings {
         EXTENSION_LOGGER_DESCRIPTOR *logger;
         EXTENSION_ASCII_PROTOCOL_DESCRIPTOR *ascii;
     } extensions;
+    bool ssl_enabled;
+#ifdef TLS
+    void         *ssl_ctx; /* holds the SSL server context which has the server certificate */
+    char         *ssl_chain_cert; /* path to the server SSL chain certificate */
+    char         *ssl_key; /* path to the server key */
+    int          ssl_verify_mode; /* client certificate verify mode */
+    int          ssl_keyformat; /* key format , default is PEM */
+    char         *ssl_ciphers; /* list of SSL ciphers */
+    char         *ssl_ca_cert; /* certificate with CAs. */
+    rel_time_t   ssl_last_cert_refresh_time; /* time of the last server certificate refresh */
+    unsigned int ssl_wbuf_size; /* size of the write buffer used by ssl_sendmsg method */
+    bool         ssl_session_cache; /* enable SSL server session caching */
+    bool         ssl_kernel_tls; /* enable server kTLS */
+    int          ssl_min_version; /* minimum SSL protocol version to accept */
+#endif
 };
 
+extern volatile rel_time_t current_time;
 extern struct settings settings;
+extern struct mc_stats mc_stats;
 extern EXTENSION_LOGGER_DESCRIPTOR *mc_logger;
 extern union mc_engine mc_engine;
 
@@ -279,10 +306,10 @@ struct conn {
     bool authenticated;
     STATE_FUNC   state;
     enum bin_substates substate;
+    struct bufferevent *bevent;
     struct event event;
     short  ev_flags;
     short  which;   /** which events were just triggered */
-
     char   *rbuf;   /** buffer to read commands into */
     char   *rcurr;  /** but if we parsed some already, this is where we stopped */
     int    rsize;   /** total allocated size of rbuf */
@@ -485,6 +512,13 @@ struct conn {
     bool io_blocked;
     bool premature_io_complete;
 #endif
+    void    *ssl;
+    uint8_t ssl_enabled;
+    char    *ssl_wbuf;
+    ssize_t (*read)          (conn *c, void *buf, size_t count);
+    ssize_t (*write)         (conn *c, void *buf, size_t count);
+    ssize_t (*sendmsg)       (conn *c, struct msghdr *msg, int flags);
+    size_t  (*bev_rbuf_size) (conn *c);
 };
 
 /* set connection's ewouldblock according to the given return value */
@@ -571,7 +605,7 @@ extern topkeys_t *default_topkeys;
  */
 conn *conn_new(const int sfd, STATE_FUNC init_state, const int event_flags,
                const int read_buffer_size, enum network_transport transport,
-               struct event_base *base, struct timeval *timeout);
+               struct event_base *base, struct timeval *timeout, void *ssl);
 #ifndef WIN32
 extern int daemonize(int nochdir, int noclose);
 #endif
@@ -603,6 +637,9 @@ void safe_close(int sfd);
 void init_check_stdin(struct event_base *base);
 
 void conn_close(conn *c);
+bool conn_init_for_hb(conn *c, int sfd, void *ssl);
+void conn_close_for_hb(conn *c);
+
 
 #if HAVE_DROP_PRIVILEGES
 extern void drop_privileges(void);

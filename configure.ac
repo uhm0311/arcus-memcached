@@ -334,7 +334,7 @@ AC_CACHE_CHECK([for libevent directory], ac_cv_libevent_dir, [
   le_found=no
   for ledir in $trylibeventdir $prefix "" /usr/local ; do
     LDFLAGS="$saved_LDFLAGS"
-    LIBS="$saved_LIBS -levent"
+    LIBS="$saved_LIBS -levent -levent_openssl -lssl -lcrypto"
 
     # Skip the directory if it isn't there.
     if test ! -z "$ledir" -a ! -d "$ledir" ; then
@@ -733,6 +733,8 @@ elif test "$SUNCC" = "yes"
 then
   CFLAGS="$CFLAGS -errfmt=error -errwarn -errshort=tags"
 fi
+
+AC_DEFINE([TLS],1,[Set to nonzero if you want to use openssl])
 
 COMMON_CFLAGS=${CFLAGS}
 ARCUSZK_CFLAGS=${COMMON_CFLAGS//-pedantic/" "}

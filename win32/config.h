@@ -1,3 +1,5 @@
+#ifdef __WIN32__
+
 #ifndef _CONFIG_H
 #define _CONFIG_H
 
@@ -92,3 +94,5 @@ struct passwd *getpwnam(const char *name);
 int setuid(_uid_t uid);
 int setgid(_uid_t gid);
 #endif // _CONFIG_H
+
+#endif

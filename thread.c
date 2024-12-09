@@ -21,6 +21,7 @@
  */
 #include "config.h"
 #include "memcached.h"
+#include "tls.h"
 #include <assert.h>
 #include <stdio.h>
 #include <errno.h>
@@ -58,8 +59,9 @@ struct conn_queue_item {
     STATE_FUNC        init_state;
     int               event_flags;
     int               read_buffer_size;
+    void              *ssl;
     enum network_transport     transport;
-    CQ_ITEM          *next;
+    CQ_ITEM           *next;
 };
 
 /* A connection queue. */
@@ -260,6 +262,12 @@ static void setup_thread(LIBEVENT_THREAD *me)
         exit(EXIT_FAILURE);
     }
 
+    me->ssl_wbuf = (char *) malloc((size_t) settings.ssl_wbuf_size);
+    if (me->ssl_wbuf == NULL) {
+        fprintf(stderr, "Failed to allocate the SSL write buffer\n");
+        exit(EXIT_FAILURE);
+    }
+
     /* create token buffer pool: count = 5000 */
     if (token_buff_create(&me->token_buff, 5000) < 0) {
         mc_logger->log(EXTENSION_LOG_WARNING, NULL,
@@ -343,7 +351,7 @@ static void thread_libevent_process(int fd, short which, void *arg)
     item = cq_pop(me->new_conn_queue);
     if (item) {
         conn *c = conn_new(item->sfd, item->init_state, item->event_flags,
-                           item->read_buffer_size, item->transport, me->base, NULL);
+                           item->read_buffer_size, item->transport, me->base, NULL, item->ssl);
         if (c == NULL) {
             if (IS_UDP(item->transport)) {
                 mc_logger->log(EXTENSION_LOG_WARNING, NULL,
@@ -354,11 +362,19 @@ static void thread_libevent_process(int fd, short which, void *arg)
                     mc_logger->log(EXTENSION_LOG_INFO, NULL,
                             "Can't listen for events on fd %d\n", item->sfd);
                 }
+                if (item->ssl) {
+                    ssl_conn_close(item->ssl);
+                    item->ssl = NULL;
+                }
                 close(item->sfd);
             }
         } else {
             assert(c->thread == NULL);
             c->thread = me;
+
+            assert(c->thread && c->thread->ssl_wbuf);
+            c->ssl_wbuf = c->thread->ssl_wbuf;
+
             /* link to the conn_list of the thread */
             if (me->conn_list != NULL) {
                 c->conn_next = me->conn_list;
@@ -378,9 +394,17 @@ static void thread_libevent_process(int fd, short which, void *arg)
         assert(me == c->thread);
         pending = pending->next;
         c->next = NULL;
-        event_add(&c->event, 0);
+        if (c->bevent != NULL) {
+            bufferevent_enable(c->bevent, EV_READ | EV_WRITE);
+        } else {
+            event_add(&c->event, 0);
+        }
 
         c->nevents = settings.reqs_per_event;
+        if (c->bevent != NULL) {
+            c->nevents *= 10;
+        }
+
         while (c->state(c)) {
             /* do task */
         }
@@ -445,7 +469,11 @@ bool should_io_blocked(const void *cookie)
     LOCK_THREAD(thr);
 #ifdef MULTI_NOTIFY_IO_COMPLETE
     if (c->current_io_wait > 0) {
-        event_del(&c->event);
+        if (c->bevent != NULL) {
+            bufferevent_disable(c->bevent, EV_READ | EV_WRITE);
+        } else {
+            event_del(&c->event);
+        }
         c->io_blocked = true;
         blocked = true;
     }
@@ -454,7 +482,11 @@ bool should_io_blocked(const void *cookie)
         /* notify_io_complete was called before we got here */
         c->premature_io_complete = false;
     } else {
-        event_del(&c->event);
+        if (c->bevent != NULL) {
+            bufferevent_disable(c->bevent, EV_READ | EV_WRITE);
+        } else {
+            event_del(&c->event);
+        }
         c->io_blocked = true;
         blocked = true;
     }
@@ -605,7 +637,7 @@ static int last_thread = -1;
  * of an incoming connection.
  */
 void dispatch_conn_new(int sfd, STATE_FUNC init_state, int event_flags,
-                       int read_buffer_size, enum network_transport transport)
+                       int read_buffer_size, enum network_transport transport, void *ssl)
 {
     CQ_ITEM *item = cqi_new();
     if (item == NULL) {
@@ -624,6 +656,7 @@ void dispatch_conn_new(int sfd, STATE_FUNC init_state, int event_flags,
     item->init_state = init_state;
     item->event_flags = event_flags;
     item->read_buffer_size = read_buffer_size;
+    item->ssl = ssl;
     item->transport = transport;
 
     cq_push(thread->new_conn_queue, item);

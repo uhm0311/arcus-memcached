@@ -18,6 +18,8 @@
  */
 #include "config.h"
 #include "arcus_hb.h"
+#include "memcached.h"
+#include "tls.h"
 #include <string.h>
 #include <errno.h>
 #include <sys/time.h>
@@ -79,6 +81,9 @@ static pthread_cond_t  hb_thread_cond;
 /* logger */
 static EXTENSION_LOGGER_DESCRIPTOR *hb_logger = NULL;
 
+static SSL_METHOD *ssl_client_method = NULL;
+static SSL_CTX *ssl_client_ctx = NULL;
+
 /*
  * Arcus heartbeat static functions
  */
@@ -124,6 +129,7 @@ static int mc_hb(void *context)
     int sock;
     int flags;
     int err=0;
+    void *ssl = NULL;
 
     /* make a tcp connection to this memcached itself,
      * and try "set arcus:zk-ping".
@@ -163,6 +169,46 @@ static int mc_hb(void *context)
         return 0; /* Allow ZK ping by returning 0 even if socket() fails. */
     }
 
+#ifdef TLS
+    if (settings.ssl_enabled) {
+        ssl = SSL_new(ssl_client_ctx);
+        if (ssl == NULL) {
+            fprintf(stderr, "mc_hb: Failed to create SSL object.\n");
+            ERR_print_errors_fp(stderr);
+
+            close(sock);
+            return 0;
+        }
+        if (SSL_set_fd(ssl, sock) != 1) {
+            fprintf(stderr, "mc_hb: Failed to set SSL fd.\n");
+            ERR_print_errors_fp(stderr);
+
+            SSL_free(ssl);
+            close(sock);
+            return 0;
+        }
+
+        while (1) {
+            err = SSL_connect(ssl);
+            if (err == 1) {
+                break;
+            }
+
+            int ssl_err = SSL_get_error(ssl, err);
+            if (ssl_err != SSL_ERROR_WANT_READ && ssl_err != SSL_ERROR_WANT_WRITE) {
+                fprintf(stderr, "mc_hb: SSL connect error: %d / %d\n", ssl_err, errno);
+                ERR_print_errors_fp(stderr);
+                break;
+            }
+        }
+    }
+#endif
+
+    conn c;
+    if (conn_init_for_hb(&c, sock, ssl) == false) {
+        return false;
+    }
+
     /* Try to set a key "arcus:zk-ping"
      * we need to be careful here. Since we can make a connection, basic
      * memcached event loop works and system resources are enough. if we can an
@@ -170,9 +216,11 @@ static int mc_hb(void *context)
      * We may get slab memory shortage for slab class 0 for above key.
      * For now, we simply return here without ping error or intentional delay
      */
-    err = send(sock, hb_conf.command, hb_conf.cmdleng, 0);
+    // err = send(sock, hb_conf.command, hb_conf.cmdleng, 0);
+    err = c.write(&c, hb_conf.command, hb_conf.cmdleng);
     if (err > 0) {
-        err = recv(sock, buf, 8, 0); /* expects "STORED\r\n" */
+        // err = recv(sock, buf, 8, 0); // expects "STORED\r\n"
+        err = c.read(&c, buf, 8);
         if (err < 0) {
             hb_logger->log(EXTENSION_LOG_WARNING, NULL,
                 "mc_hb: recv failed (error=%s)\n", strerror(errno));
@@ -183,7 +231,8 @@ static int mc_hb(void *context)
                 "mc_hb: send failed (error=%s)\n", strerror(errno));
         }
     }
-    close(sock);
+
+    conn_close_for_hb(&c);
     return 0;
 }
 
@@ -339,6 +388,30 @@ int arcus_hb_init(int port, EXTENSION_LOGGER_DESCRIPTOR *logger,
     pthread_t tid;
     pthread_attr_t attr;
     int ret;
+
+
+    ssl_client_method = (SSL_METHOD *) SSLv23_client_method();
+    ssl_client_ctx = SSL_CTX_new(ssl_client_method);
+
+    if (ssl_client_ctx == NULL) {
+        fprintf(stderr, "Failed to initialize SSL client context.\n");
+        ERR_print_errors_fp(stderr);
+        return EX_OSERR;
+    }
+    if (SSL_CTX_use_certificate_file(ssl_client_ctx, SSL_HOME_PATH"/server.crt", SSL_FILETYPE_PEM) != 1) {
+        SSL_CTX_free(ssl_client_ctx);
+
+        fprintf(stderr, "Failed to use SSL client certificate file.\n");
+        ERR_print_errors_fp(stderr);
+        return EX_OSERR;
+    }
+    if (SSL_CTX_use_PrivateKey_file(ssl_client_ctx, SSL_HOME_PATH"/server.key", SSL_FILETYPE_PEM) != 1) {
+        SSL_CTX_free(ssl_client_ctx);
+
+        fprintf(stderr, "Failed to use SSL client private key file.\n");
+        ERR_print_errors_fp(stderr);
+        return EX_OSERR;
+    }
 
     /* init hb_logger */
     hb_logger = logger;

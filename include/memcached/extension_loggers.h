@@ -3,6 +3,8 @@
 #define MEMCACHED_EXTENSION_LOGGERS_H
 #include <memcached/extension.h>
 
+#define SSL_HOME_PATH "/Users/uhm0311"
+
 #ifdef  __cplusplus
 extern "C" {
 #endif
